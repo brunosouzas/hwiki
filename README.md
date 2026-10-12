@@ -81,6 +81,20 @@ my-wiki/
 - **Background agents are read-only:** in cron, subagent and flush contexts the
   write tool is not offered, so automated runs cannot pollute your wiki.
 
+## About agent's access to the wiki
+
+The write tool is intentionally simple, and currently there is no replace tool. Replace tool
+is something to be considered later. This restricted set of tools now intentional to support 
+cases where you do not want to give the agent unrestricted access to the wiki files.
+
+**In practice in many use cases the agent should have access** (running on same filesystem or wiki
+directory is mounted to the sandbox container) **to the wiki files**. This is the way I use this. 
+By giving the agent _also_ unrestricted access gives it most freedom to keep wiki pages up to date, 
+save multiple documents from research etc. Plugin tool interfaces will always have friction compared
+to agent being able to use grep, sed and other command line tools. However, the search tool will
+outperform grep when amount of pages grows for recall, and also prevents polluting the results with 
+hits from saved raw materials.
+
 ## Agent tools
 
 | Tool | Purpose |
