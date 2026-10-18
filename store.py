@@ -10,9 +10,10 @@ Pure stdlib. Responsible for:
 * appending durable notes into the *memory zone* under a write lock,
 * refusing to persist anything that looks like a secret.
 
-Design rule: this module NEVER writes outside ``<root>/<memory_dir>``.
-The curated wiki is read-only to the memory provider — automatic writes
-must not corrupt hand-maintained synthesis pages.
+Design rule: this module NEVER writes outside ``<root>/<memory_dir>``, or,
+when ``staging_path`` is set, outside that staging folder (and then never
+under ``<root>`` at all). The curated wiki is read-only to the memory
+provider — automatic writes must not corrupt hand-maintained synthesis pages.
 """
 
 from __future__ import annotations
@@ -256,6 +257,11 @@ class WikiStore:
         home of prompt-injection payloads (customer PDFs, vendor advisories).
     memory_dir:
         Root-relative directory that the provider may write to.
+    staging_path:
+        Optional directory OUTSIDE the wiki. When set, every write goes there
+        instead of ``memory_dir`` and nothing under ``root`` is ever written.
+        Staged pages are not indexed or recalled until someone promotes them
+        into the wiki.
     """
 
     def __init__(
@@ -266,12 +272,25 @@ class WikiStore:
         exclude: Sequence[str] = (),
         untrusted_dirs: Sequence[str] = ("raw",),
         memory_dir: str = "wiki/memory",
+        staging_path: os.PathLike | str | None = None,
     ) -> None:
         self.root = Path(root).expanduser().resolve()
         self.include = tuple(include) or ("**/*.md",)
         self.exclude = tuple(exclude) + DEFAULT_EXCLUDES
         self.untrusted_dirs = tuple(d.strip("/") for d in untrusted_dirs if d.strip("/"))
         self.memory_dir = memory_dir.strip("/")
+        self.staging_root: Optional[Path] = None
+        if staging_path and str(staging_path).strip():
+            staging = Path(staging_path).expanduser()
+            if not staging.is_absolute():
+                raise ValueError(f"staging_path must be an absolute path: {staging_path}")
+            staging = staging.resolve()
+            if staging == self.root or self.root in staging.parents:
+                raise ValueError(
+                    f"staging_path must be outside the wiki root ({self.root}); "
+                    "use memory_dir for writes inside the wiki"
+                )
+            self.staging_root = staging
 
     # -- discovery ---------------------------------------------------------
 
@@ -431,10 +450,24 @@ class WikiStore:
                 out[page.slug] = missing
         return out
 
-    # -- writing (memory zone only) ---------------------------------------
+    # -- writing (memory zone or staging only) ----------------------------
+
+    @property
+    def writes_to_wiki(self) -> bool:
+        """False when writes are staged outside the wiki."""
+        return self.staging_root is None
 
     def memory_root(self) -> Path:
+        if self.staging_root is not None:
+            return self.staging_root
         return self.root / self.memory_dir
+
+    def write_location(self) -> str:
+        """Where writes land, for prompts and status: ``memory_dir`` or the staging path."""
+        return str(self.staging_root) if self.staging_root is not None else self.memory_dir
+
+    def _written_path(self, target: Path) -> str:
+        return str(target) if self.staging_root is not None else self.relpath(target)
 
     def memory_page_path(self, slug: str) -> Path:
         return self.memory_root() / f"{slugify(slug)}.md"
@@ -498,11 +531,11 @@ class WikiStore:
                     "## Log\n\n"
                 )
                 target.write_text(header + entry + "\n", encoding="utf-8")
-                return {"path": self.relpath(target), "created": True, "duplicate": False}
+                return {"path": self._written_path(target), "created": True, "duplicate": False}
 
             existing = target.read_text(encoding="utf-8", errors="replace")
             if _normalize(content) in _normalize(existing):
-                return {"path": self.relpath(target), "created": False, "duplicate": True}
+                return {"path": self._written_path(target), "created": False, "duplicate": True}
 
             if "\n## Log" not in existing:
                 existing = existing.rstrip("\n") + "\n\n## Log\n"
@@ -510,7 +543,7 @@ class WikiStore:
             updated = _bump_frontmatter_date(updated, stamp)
             target.write_text(updated, encoding="utf-8")
 
-        return {"path": self.relpath(target), "created": False, "duplicate": False}
+        return {"path": self._written_path(target), "created": False, "duplicate": False}
 
     def content_hash(self) -> str:
         """Cheap fingerprint of the corpus (paths + mtimes + sizes)."""
