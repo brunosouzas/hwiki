@@ -26,7 +26,7 @@ Configuration lives in `$HERMES_HOME/hwiki.json` (`$HERMES_HOME` is `~/.hermes`,
 | `mirror_page` | `builtin-mirror` | Memory page receiving those mirrors. |
 | `qmd_binary` | `qmd` | Path or name of the qmd executable. |
 | `qmd_collection` | `hwiki` | qmd collection name. |
-| `qmd_index` | `hwiki` | Dedicated qmd index (`qmd --index <name>`): config in `~/.config/qmd/<name>.yml`, data in `~/.cache/qmd/<name>.sqlite`. hwiki owns its `collections:` section; give each profile its own name if they point at different wikis. |
+| `qmd_index` | `hwiki` | Dedicated qmd index (`qmd --index <name>`): config in `~/.config/qmd/<name>.yml`, data in `~/.cache/qmd/<name>.sqlite`. Letters, digits, `-` and `_` only (anything else disables qmd). hwiki owns its `collections:` section; give each profile its own name if they point at different wikis. |
 | `qmd_mode` | `search` | `search` (BM25), `vsearch` (vector), `query` (hybrid + rerank). |
 | `qmd_timeout_s` | `6.0` | Per-query qmd budget before falling back to FTS5. |
 
@@ -84,9 +84,14 @@ If qmd is missing, slow or broken, recall degrades to FTS5 instead of failing.
 hwiki keeps its own qmd index (`qmd_index`, default `hwiki`) instead of using your
 default one, and writes the collection to `~/.config/qmd/<qmd_index>.yml` with an
 `ignore:` list built from `untrusted_dirs` and `exclude`, so qmd never reads those
-folders. Other keys in that file (for example `models`) are kept. `exclude` globs
-are translated to qmd's glob syntax (where `*` does not cross `/`); hwiki still
-filters every qmd result with its own rules.
+folders. Other keys in that file (for example `models`) are kept; without PyYAML
+an existing file is never overwritten (qmd is skipped instead). `exclude` globs are
+translated to qmd's glob syntax so that qmd ignores at least what hwiki excludes:
+in hwiki's `fnmatch` a `*` or `?` also matches `/`, so each wildcard is emitted
+both inside a segment and across segments, and literal characters such as `(`,
+`{` or `!` are escaped. hwiki still filters every qmd result with its own rules.
+When files leave the collection, hwiki runs `qmd cleanup` to drop their content
+and vectors, and retries it on the next sync until it succeeds.
 
 Upgrading from 1.0.0: earlier versions added the wiki to your *default* qmd index,
 including `untrusted_dirs` and `exclude`. Remove that copy with
