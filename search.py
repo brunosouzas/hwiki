@@ -303,15 +303,25 @@ def loopback_url(url: str) -> Optional[str]:
     return urllib.parse.urlunsplit(("http", parsed.netloc, parsed.path.rstrip("/"), "", ""))
 
 
-def clean_snippet(text: str) -> str:
-    """Drop qmd's ``@@ -a,b @@ (...)`` hunk headers and ``N:`` line prefixes."""
-    lines = []
-    for line in str(text or "").splitlines():
-        line = _SNIPPET_LINE_NO.sub("", line, count=1)
-        if _SNIPPET_HUNK.match(line.strip()):
-            continue
-        lines.append(line)
-    return " ".join(" ".join(lines).split())
+def clean_snippet(text: str, *, numbered: bool = False) -> str:
+    """Drop qmd's ``@@ -a,b @@ (...)`` hunk headers, and ``N:`` line prefixes.
+
+    Line prefixes come only from qmd's HTTP server (``numbered``), and are
+    removed only when every line carries one, so note text such as
+    ``10:30 deployment`` is kept.
+    """
+    lines = str(text or "").splitlines()
+    if numbered and all(_SNIPPET_LINE_NO.match(line) for line in lines if line.strip()):
+        lines = [_SNIPPET_LINE_NO.sub("", line, count=1) for line in lines]
+    kept = [line for line in lines if not _SNIPPET_HUNK.match(line.strip())]
+    return " ".join(" ".join(kept).split())
+
+
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """A redirect from the loopback qmd server could send the query elsewhere."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        return None
 
 
 def qmd_config_dir() -> Path:
@@ -491,8 +501,11 @@ class QmdBackend:
                 "wiki memory: qmd_url must be an http URL on localhost/127.0.0.1/::1; "
                 "ignoring it and using the qmd CLI"
             )
-        # Loopback calls never go through a proxy, or the query would leave the machine.
-        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        # Loopback calls never go through a proxy or follow a redirect, or the
+        # query could leave the machine.
+        self._opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _RefuseRedirects()
+        )
 
     def resolve_binary(self) -> Optional[str]:
         return shutil.which(self.binary) or (self.binary if Path(self.binary).is_file() else None)
@@ -672,7 +685,7 @@ class QmdBackend:
             # Never log the message: it can quote the request (the user's text).
             logger.debug("qmd http %s failed: %s", self.mode, type(exc).__name__)
             return []
-        return self._parse(payload, limit)
+        return self._parse(payload, limit, http=True)
 
     def _is_permitted(self, rel: str) -> bool:
         """Trust boundary for qmd results.
@@ -696,7 +709,7 @@ class QmdBackend:
             return False
         return abspath.is_file()
 
-    def _parse(self, stdout: str, limit: int) -> List[SearchHit]:
+    def _parse(self, stdout: str, limit: int, *, http: bool = False) -> List[SearchHit]:
         payload = _extract_json(stdout)
         if payload is None:
             return []
@@ -713,7 +726,7 @@ class QmdBackend:
             if not isinstance(item, dict):
                 continue
             raw_path = str(item.get("file") or item.get("path") or "")
-            rel = self._to_relpath(raw_path)
+            rel = self._to_relpath(raw_path, decode=http)
             if not self._is_permitted(rel):
                 dropped += 1
                 continue
@@ -721,7 +734,7 @@ class QmdBackend:
                 path=rel,
                 title=str(item.get("title") or ""),
                 heading="",
-                snippet=clean_snippet(item.get("snippet") or item.get("text") or "")[:600],
+                snippet=clean_snippet(item.get("snippet") or item.get("text") or "", numbered=http)[:600],
                 score=float(item.get("score") or 0.0),
                 backend=self.name,
                 meta={"docid": str(item["docid"])} if item.get("docid") else {},
@@ -730,15 +743,18 @@ class QmdBackend:
             logger.debug("qmd: filtered %d untrusted/unknown result(s)", dropped)
         return hits
 
-    def _to_relpath(self, raw: str) -> str:
+    def _to_relpath(self, raw: str, *, decode: bool = False) -> str:
         """Normalise ``qmd://collection/rel/path.md`` and absolute paths.
 
-        With ``--index`` qmd appends ``?index=<name>`` to the URI; it is dropped.
+        With ``--index`` the CLI appends ``?index=<name>`` to the URI; it is
+        dropped. The HTTP server percent-encodes the path (``decode``); the
+        CLI does not. The result still goes through ``_is_permitted``.
         """
         if raw.startswith("qmd://"):
             trimmed = raw[len("qmd://"):].split("?", 1)[0]
             _, _, rest = trimmed.partition("/")
-            return rest or trimmed
+            rest = rest or trimmed
+            return urllib.parse.unquote(rest) if decode else rest
         try:
             return self.store.relpath(raw)
         except Exception:

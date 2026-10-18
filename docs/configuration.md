@@ -110,7 +110,7 @@ qmd --index hwiki mcp --http --port 8181     # same index name as qmd_index
 
 Run the server under your service manager (launchd, systemd) so it survives
 restarts. hwiki only talks to a server on a loopback address and never through a
-proxy, because the request carries your message. If the server is down, recall
+proxy and never follows a redirect, because the request carries your message. If the server is down, recall
 falls back to FTS5 within `qmd_timeout_s`. Indexing still uses the CLI, in a
 background thread, so a turn never waits for `qmd update` or `qmd embed`.
 

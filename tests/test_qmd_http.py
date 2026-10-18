@@ -43,6 +43,9 @@ def wiki(tmp_path):
     )
     (root / "private" / "c.md").write_text("# Private\n\nThe privatenarwhal is private.\n",
                                            encoding="utf-8")
+    (root / "notes" / "Release Plan.md").write_text("# Plan\n\nThe encodedheron flies.\n",
+                                                   encoding="utf-8")
+    (root / "notes" / "café.md").write_text("# Café\n\nThe accentedcrane flies.\n", encoding="utf-8")
     return root
 
 
@@ -55,16 +58,24 @@ def isolated_qmd(tmp_path, monkeypatch):
 class StandIn:
     """Loopback HTTP server answering every POST with one recorded body."""
 
-    def __init__(self, body: bytes, status: int = 200, delay: float = 0.0):
+    def __init__(self, body: bytes, status: int = 200, delay: float = 0.0, headers=None):
         self.requests: list = []
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                outer.requests.append({"path": self.path, "body": None})
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(body)
+
             def do_POST(self):  # noqa: N802
                 length = int(self.headers.get("Content-Length") or 0)
                 outer.requests.append({"path": self.path, "body": json.loads(self.rfile.read(length))})
                 time.sleep(delay)
                 self.send_response(status)
+                for key, value in (headers or {}).items():
+                    self.send_header(key, value)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(body)
@@ -205,6 +216,44 @@ def test_only_loopback_http_urls_are_accepted(url, expected):
     assert loopback_url(url) == expected
 
 
+def test_redirects_are_not_followed(wiki, isolated_qmd):
+    elsewhere = StandIn((FIXTURES / "qmd_http_query_lex.json").read_bytes())
+    for status in (301, 302, 303, 307, 308):
+        redirecting = StandIn(b"", status=status, headers={"Location": f"{elsewhere.url}/query?q=x"})
+        try:
+            store = WikiStore(wiki, untrusted_dirs=[])
+            assert QmdBackend(store, collection="wiki", url=redirecting.url).search("secret words") == []
+        finally:
+            redirecting.close()
+    elsewhere.close()
+    assert elsewhere.requests == []
+
+
+def test_http_paths_are_percent_decoded(wiki, isolated_qmd):
+    stand_in = StandIn((FIXTURES / "qmd_http_query_encoded.json").read_bytes())
+    try:
+        store = WikiStore(wiki, untrusted_dirs=[])
+        hits = QmdBackend(store, collection="wiki", url=stand_in.url).search("flies", limit=5)
+    finally:
+        stand_in.close()
+    assert [h.path for h in hits] == ["notes/Release Plan.md", "notes/café.md"]
+    assert hits[1].snippet == "The accentedcrane flies at 10:30."
+
+
+def test_encoded_traversal_is_rejected(wiki, isolated_qmd):
+    body = json.dumps({"results": [
+        {"file": "qmd://wiki/%2E%2E/%2E%2E/etc/passwd", "title": "x", "snippet": "1: x"},
+        {"file": "qmd://wiki/private%2Fc.md", "title": "x", "snippet": "1: x"},
+        {"file": "qmd://wiki/notes/a%00.md", "title": "x", "snippet": "1: x"},
+    ]}).encode()
+    stand_in = StandIn(body)
+    try:
+        store = WikiStore(wiki, untrusted_dirs=[], exclude=["private/*"])
+        assert QmdBackend(store, collection="wiki", url=stand_in.url).search("x") == []
+    finally:
+        stand_in.close()
+
+
 def test_non_loopback_url_falls_back_to_the_cli(wiki, isolated_qmd):
     store = WikiStore(wiki, untrusted_dirs=[])
     assert QmdBackend(store, url="http://example.com:8181").url is None
@@ -215,8 +264,13 @@ def test_snippets_from_recorded_cli_and_http_output_are_cleaned():
     http = json.loads((FIXTURES / "qmd_http_query_lex.json").read_text(encoding="utf-8"))
     expected = "The allowedwombat release is tagged on Fridays."
     assert clean_snippet(cli[0]["snippet"]) == expected
-    assert clean_snippet(http["results"][0]["snippet"]) == expected
+    assert clean_snippet(http["results"][0]["snippet"], numbered=True) == expected
     assert clean_snippet("plain text, no markers") == "plain text, no markers"
+    # note text that looks like a line number is kept
+    assert clean_snippet("10:30 deployment starts\n12: items") == "10:30 deployment starts 12: items"
+    assert clean_snippet("10:30 deployment starts\nnext line", numbered=True) == \
+        "10:30 deployment starts next line"
+    assert clean_snippet("7: 10:30 deployment starts\n8: ", numbered=True) == "10:30 deployment starts"
 
 
 def test_cli_result_with_index_suffix_maps_to_the_page(wiki):
@@ -268,9 +322,40 @@ def test_background_qmd_sync_does_not_block_and_never_overlaps():
 
 def test_foreground_qmd_sync_waits_for_qmd():
     qmd = BlockingQmd()
+    hybrid = HybridBackend(CountingFts(), qmd)
+    caller = threading.Thread(target=hybrid.sync)
+    caller.start()
+    assert qmd.started.wait(2)
+    caller.join(0.3)
+    assert caller.is_alive(), "foreground sync returned before qmd finished"
     qmd.release.set()
-    HybridBackend(CountingFts(), qmd).sync()
-    assert qmd.calls == 1
+    caller.join(5)
+    assert not caller.is_alive() and qmd.calls == 1
+
+
+def test_provider_does_not_wait_for_qmd_sync(wiki, isolated_qmd, tmp_path, monkeypatch):
+    from hwiki import WikiMemoryProvider
+    from hwiki import config as cfg
+
+    for var in list(cfg._ENV_OVERRIDES) + list(cfg._LEGACY_ENV_OVERRIDES):
+        monkeypatch.delenv(var, raising=False)
+    slow_qmd = tmp_path / "slow-qmd"
+    slow_qmd.write_text("#!/bin/sh\nsleep 3\nexit 0\n", encoding="utf-8")
+    slow_qmd.chmod(0o755)
+    home = tmp_path / "home"
+    home.mkdir()
+    provider = WikiMemoryProvider(config=dict(
+        cfg.DEFAULTS, wiki_path=str(wiki), backend="qmd", qmd_binary=str(slow_qmd),
+        qmd_index="hwiki-provider-test", _hermes_home=str(home),
+    ))
+    started = time.perf_counter()
+    provider.initialize("sess-1", hermes_home=str(home))
+    assert time.perf_counter() - started < 2, "initialize() waited for qmd"
+    assert provider._backend.name == "hybrid"
+    started = time.perf_counter()
+    provider._maybe_reindex(force=True)
+    assert time.perf_counter() - started < 2, "reindex waited for qmd"
+    provider.shutdown()
 
 
 # -- real qmd server -------------------------------------------------------
@@ -302,6 +387,8 @@ def test_real_qmd_http_server_end_to_end(wiki, isolated_qmd, tmp_path):
 
         hits = qmd.search("allowedwombat release", limit=4)
         assert [h.path for h in hits] == ["notes/release.md"]
+        assert [h.path for h in qmd.search("encodedheron")] == ["notes/Release Plan.md"]
+        assert [h.path for h in qmd.search("accentedcrane")] == ["notes/café.md"]
         assert "allowedwombat release is tagged" in hits[0].snippet
         assert not hits[0].snippet.startswith(("@@", "5:"))
         assert qmd.search("privatenarwhal") == []
