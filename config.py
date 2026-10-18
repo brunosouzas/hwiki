@@ -45,6 +45,8 @@ DEFAULTS: Dict[str, Any] = {
     "qmd_binary": "qmd",
     "qmd_collection": "hwiki",
     "qmd_index": "hwiki",          # dedicated qmd index (--index); never the default one
+    "qmd_url": "",                 # loopback qmd HTTP server (qmd --index <qmd_index> mcp --http)
+    "qmd_rerank": False,           # qmd_mode=query over HTTP: LLM rerank (needs the rerank model)
     "qmd_mode": "search",           # search | vsearch | query
     "qmd_timeout_s": 6.0,
     "max_hits_per_page": 2,         # ranking partition: per-page chunk cap
@@ -60,6 +62,7 @@ _ENV_OVERRIDES = {
     "HWIKI_MEMORY_DIR": "memory_dir",
     "HWIKI_QMD_BINARY": "qmd_binary",
     "HWIKI_QMD_MODE": "qmd_mode",
+    "HWIKI_QMD_URL": "qmd_url",
 }
 
 # Pre-1.0 names, honoured when the HWIKI_* equivalent is unset.
@@ -180,6 +183,8 @@ def build_runtime(config: Optional[Dict[str, Any]] = None):
         qmd_mode=str(config.get("qmd_mode") or "search"),
         qmd_timeout=float(config.get("qmd_timeout_s") or 6.0),
         qmd_index=str(config.get("qmd_index") or "hwiki"),
+        qmd_url=str(config.get("qmd_url") or ""),
+        qmd_rerank=bool(config.get("qmd_rerank")),
         max_hits_per_page=int(config.get("max_hits_per_page") or 2),
         demote_paths=list(config.get("demote_paths") or []),
         fetch_multiplier=int(config.get("fetch_multiplier") or 4),

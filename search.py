@@ -22,6 +22,7 @@ Everything returns ``SearchHit`` objects so the provider is backend-agnostic.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import os
@@ -31,6 +32,8 @@ import sqlite3
 import subprocess
 import threading
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
@@ -275,6 +278,42 @@ class Fts5Backend:
 # qmd
 # ---------------------------------------------------------------------------
 
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+_SNIPPET_LINE_NO = re.compile(r"^\s*\d+:\s?")
+_SNIPPET_HUNK = re.compile(r"^@@ .* @@.*$")
+
+
+def loopback_url(url: str) -> Optional[str]:
+    """``url`` without a trailing slash if it is plain http on a loopback host, else None.
+
+    The qmd server receives the query text (the user's message), so hwiki only
+    talks to one on this machine.
+    """
+    try:
+        parsed = urllib.parse.urlsplit((url or "").strip())
+        port = parsed.port
+    except ValueError:
+        return None
+    if parsed.scheme != "http" or (parsed.hostname or "").lower() not in _LOOPBACK_HOSTS:
+        return None
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        return None
+    if port is not None and not 1 <= port <= 65535:
+        return None
+    return urllib.parse.urlunsplit(("http", parsed.netloc, parsed.path.rstrip("/"), "", ""))
+
+
+def clean_snippet(text: str) -> str:
+    """Drop qmd's ``@@ -a,b @@ (...)`` hunk headers and ``N:`` line prefixes."""
+    lines = []
+    for line in str(text or "").splitlines():
+        line = _SNIPPET_LINE_NO.sub("", line, count=1)
+        if _SNIPPET_HUNK.match(line.strip()):
+            continue
+        lines.append(line)
+    return " ".join(" ".join(lines).split())
+
+
 def qmd_config_dir() -> Path:
     """The directory qmd reads ``<index>.yml`` from (same resolution as qmd itself)."""
     if os.environ.get("QMD_CONFIG_DIR"):
@@ -403,6 +442,10 @@ class QmdBackend:
       ``vsearch`` vector only           (~3s warm, needs embed models)
       ``query``   hybrid + rerank       (best quality, slowest, ~2-3s warm)
 
+    With ``url`` set (a ``qmd mcp --http`` server on a loopback address,
+    started with the same ``--index``), searches go to its ``/query``
+    endpoint, where the models stay loaded; indexing still uses the CLI.
+
     hwiki owns a dedicated qmd index (``--index <index>``, so
     ``<qmd config dir>/<index>.yml`` and qmd's ``<index>.sqlite``) instead of
     the user's default one. The collection is written to that index's YAML
@@ -422,6 +465,8 @@ class QmdBackend:
         mode: str = "search",
         timeout: float = 6.0,
         index: str = "hwiki",
+        url: str = "",
+        rerank: bool = False,
     ) -> None:
         self.store = store
         self.collection = collection
@@ -439,6 +484,15 @@ class QmdBackend:
         self._registered = False
         self._config_changed = False
         self._lock = threading.RLock()
+        self.rerank = bool(rerank)
+        self.url = loopback_url(url) if url else None
+        if url and self.url is None:
+            logger.warning(
+                "wiki memory: qmd_url must be an http URL on localhost/127.0.0.1/::1; "
+                "ignoring it and using the qmd CLI"
+            )
+        # Loopback calls never go through a proxy, or the query would leave the machine.
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def resolve_binary(self) -> Optional[str]:
         return shutil.which(self.binary) or (self.binary if Path(self.binary).is_file() else None)
@@ -578,6 +632,8 @@ class QmdBackend:
         query = (query or "").strip()
         if not query or not self.ensure_collection():
             return []
+        if self.url:
+            return self._search_http(query, limit)
         # Over-fetch: untrusted hits are dropped below, and qmd has no
         # server-side exclusion, so ask for headroom to still fill `limit`.
         args = [self.mode, query, "--json", "-n", str(max(int(limit) * 3, int(limit) + 5)),
@@ -594,6 +650,29 @@ class QmdBackend:
             logger.debug("qmd exited %s: %s", proc.returncode, (proc.stderr or "")[:200])
             return []
         return self._parse(proc.stdout or "", limit)
+
+    def _search_http(self, query: str, limit: int) -> List[SearchHit]:
+        kinds = {"search": ["lex"], "vsearch": ["vec"], "query": ["lex", "vec"]}[self.mode]
+        body = {
+            "searches": [{"type": kind, "query": query} for kind in kinds],
+            "collections": [self.collection],
+            "limit": max(int(limit) * 3, int(limit) + 5),
+            "rerank": self.mode == "query" and self.rerank,
+        }
+        request = urllib.request.Request(
+            f"{self.url}/query",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with self._opener.open(request, timeout=self.timeout) as response:
+                payload = response.read().decode("utf-8", errors="replace")
+        except Exception as exc:
+            # Never log the message: it can quote the request (the user's text).
+            logger.debug("qmd http %s failed: %s", self.mode, type(exc).__name__)
+            return []
+        return self._parse(payload, limit)
 
     def _is_permitted(self, rel: str) -> bool:
         """Trust boundary for qmd results.
@@ -642,7 +721,7 @@ class QmdBackend:
                 path=rel,
                 title=str(item.get("title") or ""),
                 heading="",
-                snippet=" ".join(str(item.get("snippet") or item.get("text") or "").split())[:600],
+                snippet=clean_snippet(item.get("snippet") or item.get("text") or "")[:600],
                 score=float(item.get("score") or 0.0),
                 backend=self.name,
                 meta={"docid": str(item["docid"])} if item.get("docid") else {},
@@ -695,21 +774,52 @@ class HybridBackend:
 
     name = "hybrid"
 
-    def __init__(self, fts: Fts5Backend, qmd: QmdBackend) -> None:
+    def __init__(self, fts: Fts5Backend, qmd: QmdBackend, *, background_qmd_sync: bool = False) -> None:
         self.fts = fts
         self.qmd = qmd
+        self.background_qmd_sync = background_qmd_sync
+        self._qmd_sync_lock = threading.Lock()
+        self._qmd_sync_thread: Optional[threading.Thread] = None
 
     def is_available(self) -> bool:
         return self.fts.is_available()
 
     def sync(self, *, force: bool = False) -> Dict[str, int]:
+        """FTS5 now; qmd now, or in a background thread for the provider.
+
+        ``qmd update`` and ``qmd embed`` can take minutes on a large change,
+        and the provider reindexes from prefetch, so with
+        ``background_qmd_sync`` a turn never waits for them: at most one qmd
+        sync runs at a time, and a sync requested meanwhile is skipped (the
+        next reindex picks the change up).
+        """
         stats = self.fts.sync(force=force)
-        if self.qmd.is_available():
+        if not self.qmd.is_available():
+            return stats
+        if not self.background_qmd_sync:
+            self._run_qmd_sync(force)
+            return stats
+        if not self._qmd_sync_lock.acquire(blocking=False):
+            return stats
+
+        def _run() -> None:
             try:
-                self.qmd.sync(force=force)
-            except Exception as exc:
-                logger.debug("hybrid: qmd sync skipped: %s", exc)
+                self._run_qmd_sync(force)
+            finally:
+                self._qmd_sync_lock.release()
+
+        ctx = contextvars.copy_context()  # keep the caller's profile context
+        self._qmd_sync_thread = threading.Thread(
+            target=lambda: ctx.run(_run), name="hwiki-qmd-sync", daemon=True
+        )
+        self._qmd_sync_thread.start()
         return stats
+
+    def _run_qmd_sync(self, force: bool) -> None:
+        try:
+            self.qmd.sync(force=force)
+        except Exception as exc:
+            logger.debug("hybrid: qmd sync skipped: %s", type(exc).__name__)
 
     def count(self) -> Dict[str, int]:
         return self.fts.count()
@@ -890,6 +1000,9 @@ def build_backend(
     qmd_mode: str = "search",
     qmd_timeout: float = 6.0,
     qmd_index: str = "hwiki",
+    qmd_url: str = "",
+    qmd_rerank: bool = False,
+    qmd_background_sync: bool = False,
     max_hits_per_page: int = 2,
     demote_paths: Optional[Sequence[str]] = None,
     fetch_multiplier: int = 4,
@@ -913,6 +1026,7 @@ def build_backend(
         qmd = QmdBackend(
             store, collection=qmd_collection, binary=qmd_binary,
             mode=qmd_mode, timeout=qmd_timeout, index=qmd_index,
+            url=qmd_url, rerank=qmd_rerank,
         )
         if not qmd.is_available():
             logger.warning(
@@ -921,7 +1035,7 @@ def build_backend(
             )
             core = fts
         else:
-            core = HybridBackend(fts, qmd)  # qmd alone would lose the safety net
+            core = HybridBackend(fts, qmd, background_qmd_sync=qmd_background_sync)  # qmd alone would lose the safety net
     partition = RankingPartitionBackend(
         core,
         max_hits_per_page=max_hits_per_page,

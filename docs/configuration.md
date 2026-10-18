@@ -29,11 +29,13 @@ Configuration lives in `$HERMES_HOME/hwiki.json` (`$HERMES_HOME` is `~/.hermes`,
 | `qmd_index` | `hwiki` | Dedicated qmd index (`qmd --index <name>`): config in `~/.config/qmd/<name>.yml`, data in `~/.cache/qmd/<name>.sqlite`. Letters, digits, `-` and `_` only, and never qmd's default `index` (anything else disables qmd). hwiki owns its `collections:` section; give each profile its own name if they point at different wikis. |
 | `qmd_mode` | `search` | `search` (BM25), `vsearch` (vector), `query` (hybrid + rerank). |
 | `qmd_timeout_s` | `6.0` | Per-query qmd budget before falling back to FTS5. |
+| `qmd_url` | | A qmd HTTP server on this machine (`http://localhost:<port>`, `127.0.0.1` or `[::1]` only), started with the same `qmd_index`. Searches go there instead of starting a qmd process per query. Other hosts are refused. |
+| `qmd_rerank` | `false` | With `qmd_url` and `qmd_mode: query`, ask qmd to rerank with its LLM (needs the rerank model; slower). |
 
 ### Environment overrides
 
 Environment variables win over the file: `HWIKI_PATH`, `HWIKI_BACKEND`,
-`HWIKI_MEMORY_DIR`, `HWIKI_QMD_BINARY`, `HWIKI_QMD_MODE`.
+`HWIKI_MEMORY_DIR`, `HWIKI_QMD_BINARY`, `HWIKI_QMD_MODE`, `HWIKI_QMD_URL`.
 
 ### Upgrading from the pre-1.0 `wiki` provider
 
@@ -92,6 +94,25 @@ both inside a segment and across segments, and literal characters such as `(`,
 `{` or `!` are escaped. hwiki still filters every qmd result with its own rules.
 When files leave the collection, hwiki runs `qmd cleanup` to drop their content
 and vectors, and retries it on the next sync until it succeeds.
+
+### Keep the models loaded: `qmd_url`
+
+Each CLI call starts a new qmd process, and the vector modes load their models
+every time: on an Apple M3, `qmd vsearch` took 6 to 21 seconds per query on a
+550-note vault, past the default `qmd_timeout_s`, so recall silently fell back to
+FTS5. qmd's HTTP server keeps the models loaded; the same queries took 150 to
+200 ms (about 4 s for the first one).
+
+```bash
+qmd --index hwiki mcp --http --port 8181     # same index name as qmd_index
+# then in hwiki.json: "backend": "qmd", "qmd_mode": "vsearch", "qmd_url": "http://localhost:8181"
+```
+
+Run the server under your service manager (launchd, systemd) so it survives
+restarts. hwiki only talks to a server on a loopback address and never through a
+proxy, because the request carries your message. If the server is down, recall
+falls back to FTS5 within `qmd_timeout_s`. Indexing still uses the CLI, in a
+background thread, so a turn never waits for `qmd update` or `qmd embed`.
 
 Upgrading from 1.0.0: earlier versions added the wiki to your *default* qmd index,
 including `untrusted_dirs` and `exclude`. Remove that copy with
@@ -154,6 +175,7 @@ picked up within `reindex_interval_s`. Force with `hermes hwiki index`.
 **`database is locked`.** Two Hermes processes share one `index_path`. Give each
 profile its own; the index is disposable.
 
-**qmd is slow on the first query.** Vector modes load their models on first use.
-Run a warm qmd daemon, raise `qmd_timeout_s`, or use `qmd_mode: search`. Timeouts
+**qmd is slow on the first query.** Vector modes load their models on every CLI
+call. Run qmd's HTTP server and set `qmd_url`, raise `qmd_timeout_s`, or use
+`qmd_mode: search`. Timeouts
 are not fatal: you get FTS5 results.

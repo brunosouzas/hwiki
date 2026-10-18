@@ -130,13 +130,14 @@ hermes hwiki migrate --dry-run   # import facts from the holographic provider
 | `auto_recall` | `true` | `false` = tools only |
 
 Environment overrides: `HWIKI_PATH`, `HWIKI_BACKEND`, `HWIKI_MEMORY_DIR`,
-`HWIKI_QMD_BINARY`, `HWIKI_QMD_MODE`. All options, qmd tuning and Docker setup:
+`HWIKI_QMD_BINARY`, `HWIKI_QMD_MODE`, `HWIKI_QMD_URL`. All options, qmd tuning and Docker setup:
 [docs/configuration.md](docs/configuration.md).
 
 ## Privacy and security
 
 - **No network access** with the default `fts5` backend. Your notes never leave
-  the machine. The optional qmd backend runs local models.
+  the machine. The optional qmd backend runs local models; with `qmd_url`, queries
+  go to a qmd server on localhost only.
 - **Data locations:** your wiki folder (which you choose) plus
   `$HERMES_HOME/hwiki.json` and `$HERMES_HOME/hwiki-index.sqlite` (disposable,
   rebuilt on demand).

@@ -12,7 +12,7 @@ prompt injection, so the design starts from that.
 | **Path-traversal defence** | Every path is resolved and checked for containment inside the wiki root; anything escaping it is rejected. |
 | **Secret guard** | Detectors for AWS and Scaleway keys, GitHub and Slack tokens, Google API keys, `sk-` style keys, PEM private keys, JWTs and inline `password=` values. Applied to `wiki_memory_write`, built-in memory mirroring and migration imports. |
 | **Query-syntax safety** | Every search token is quoted, so FTS5 operators in user input are treated as data. Fuzz-tested. |
-| **No network** | The default `fts5` backend makes no outbound calls. |
+| **No network** | The default `fts5` backend makes no outbound calls. With `qmd_url`, the query goes only to a qmd server on a loopback address, never through a proxy; any other URL is refused. |
 | **No transcript ingestion** | Conversations are never written automatically; only deliberate facts land in the wiki. |
 | **Bounded recall** | `prefetch_max_chars` caps injected context, and Hermes hard-times-out prefetch. |
 | **Concurrency** | File locking around appends; degrades to unlocked rather than losing a write. |
