@@ -105,6 +105,83 @@ def test_newly_excluded_folder_is_purged_from_the_index(qmd_env, wiki):
     assert ALLOWED.encode() in data
 
 
+EMBED_MODEL_FILE = "hf_ggml-org_embeddinggemma-300M-Q8_0.gguf"
+
+
+def embed_models_dir() -> Path:
+    """Opt-in: a folder that already holds qmd's embedding model (no download in tests)."""
+    folder = os.environ.get("HWIKI_QMD_EMBED_MODELS", "")
+    if not folder:
+        pytest.skip("set HWIKI_QMD_EMBED_MODELS to a folder holding " + EMBED_MODEL_FILE)
+    model = Path(folder).expanduser() / EMBED_MODEL_FILE
+    if not model.is_file():
+        pytest.skip(f"{model} not found")
+    return model
+
+
+def vector_state(cache_dir: Path, rel_path: str) -> dict:
+    """What qmd's index holds for one document: its rows and raw embedding bytes."""
+    import sqlite3
+
+    db = sqlite3.connect(str(cache_dir / "qmd" / f"{INDEX}.sqlite"))
+    try:
+        row = db.execute("SELECT hash FROM documents WHERE path = ?", (rel_path,)).fetchone()
+        doc_hash = row[0] if row else None
+        state = {"document": row is not None, "content_vectors": 0, "vec_rowids": [], "vectors": []}
+        if not doc_hash:
+            return state
+        state["content_vectors"] = db.execute(
+            "SELECT COUNT(*) FROM content_vectors WHERE hash = ?", (doc_hash,)).fetchone()[0]
+        size = db.execute("SELECT size FROM vectors_vec_chunks LIMIT 1").fetchone()[0]
+        # sqlite-vec's vec0 table keeps ids in a plain shadow table and vectors in
+        # fixed-size chunk blobs, so both can be read without loading the extension.
+        rows = db.execute(
+            "SELECT chunk_id, chunk_offset FROM vectors_vec_rowids WHERE substr(id, 1, ?) = ?",
+            (len(doc_hash) + 1, doc_hash + "_")).fetchall()
+        for chunk_id, offset in rows:
+            blob = db.execute("SELECT vectors FROM vectors_vec_vector_chunks00 WHERE rowid = ?",
+                              (chunk_id,)).fetchone()[0]
+            width = len(blob) // size
+            state["vec_rowids"].append(offset)
+            state["vectors"].append(bytes(blob[offset * width:(offset + 1) * width]))
+        return state
+    finally:
+        db.close()
+
+
+def test_newly_excluded_folder_is_purged_from_embeddings(qmd_env, wiki):
+    """Opt-in (real embedding model): exclusion also removes vectors, not just rows.
+
+    Index and embed everything, then exclude ``private/`` and sync again. The
+    excluded document's rows must be gone, and its raw embedding bytes must not
+    remain anywhere in qmd's database files.
+    """
+    model = embed_models_dir()
+    models = qmd_env["cache"] / "qmd" / "models"
+    models.mkdir(parents=True)
+    (models / EMBED_MODEL_FILE).symlink_to(model)
+
+    def vsearch_backend(store):
+        return QmdBackend(store, collection="wiki", binary=qmd_env["binary"], mode="vsearch",
+                          timeout=120, index=INDEX)
+
+    vsearch_backend(WikiStore(wiki, untrusted_dirs=[], exclude=[])).sync()
+    before = vector_state(qmd_env["cache"], "private/c.md")
+    assert before["document"] and before["content_vectors"] >= 1
+    assert before["vectors"] and all(any(v) for v in before["vectors"])
+    assert vector_state(qmd_env["cache"], "notes/a.md")["vectors"]
+
+    vsearch_backend(WikiStore(wiki, untrusted_dirs=["raw"], exclude=["private/*"])).sync()
+
+    after = vector_state(qmd_env["cache"], "private/c.md")
+    assert after == {"document": False, "content_vectors": 0, "vec_rowids": [], "vectors": []}
+    data = index_bytes(qmd_env["cache"])
+    for vector in before["vectors"]:
+        assert vector not in data
+    assert PRIVATE.encode() not in data
+    assert vector_state(qmd_env["cache"], "notes/a.md")["vectors"]  # allowed vectors kept
+
+
 def test_deleted_file_is_purged_from_the_index(qmd_env, wiki):
     store = WikiStore(wiki, untrusted_dirs=["raw"], exclude=["private/*"])
     backend(store, qmd_env["binary"]).sync()
