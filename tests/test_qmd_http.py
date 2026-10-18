@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import threading
@@ -281,12 +282,14 @@ def test_real_qmd_http_server_end_to_end(wiki, isolated_qmd, tmp_path):
     qmd = QmdBackend(store, collection="wiki", binary=binary, mode="search",
                      index="hwiki-http-test", url=f"http://localhost:{port}", timeout=10)
     qmd.sync()
+    # qmd's launcher starts the server as a child process: give the pair its own
+    # process group so teardown stops both, not just the launcher.
     server = subprocess.Popen(
         [binary, "--index", "hwiki-http-test", "mcp", "--http", "--port", str(port)],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
     )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         deadline = time.time() + 20
         while True:
             try:
@@ -309,5 +312,10 @@ def test_real_qmd_http_server_end_to_end(wiki, isolated_qmd, tmp_path):
         qmd.sync()
         assert [h.path for h in qmd.search("latecomerotter")] == ["notes/later.md"]
     finally:
-        server.terminate()
+        try:
+            os.killpg(server.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
         server.wait(10)
+        with pytest.raises(Exception):
+            opener.open(f"http://localhost:{port}/health", timeout=1)
