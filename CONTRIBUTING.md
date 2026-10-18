@@ -31,6 +31,10 @@ hermes plugins validate .
 Set `HWIKI_BENCH_PATH=/path/to/a/wiki` to additionally index and time a real wiki
 in `tests/test_store_search.py`.
 
+`tests/test_qmd_index.py` runs the real qmd CLI (BM25 only, no model downloads) in
+a throwaway config and cache directory. It runs when `qmd` is on `PATH`, or when
+`HWIKI_QMD_BINARY` points at it, and is skipped otherwise.
+
 ## Pull requests
 
 Add a test for every behaviour change, ideally one that fails before your change.
