@@ -172,6 +172,7 @@ def build_runtime(config: Optional[Dict[str, Any]] = None):
     )
 
     index_path = expand_path(str(config.get("index_path") or ""), home) or default_index_path(home)
+    store.assert_outside_wiki(index_path, "index_path")
 
     backend = build_backend(
         store,

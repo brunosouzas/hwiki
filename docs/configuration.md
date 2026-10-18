@@ -11,7 +11,7 @@ Configuration lives in `$HERMES_HOME/hwiki.json` (`$HERMES_HOME` is `~/.hermes`,
 | `wiki_path` | | **Required.** Wiki root. `$HERMES_HOME` and `~` expand. |
 | `backend` | `fts5` | `fts5` or `qmd` (`qmd` builds a hybrid with FTS5 fallback). |
 | `memory_dir` | `wiki/memory` | Wiki-relative folder the agent may write to. The only writable path. |
-| `staging_path` | | Absolute folder **outside** the wiki. When set, agent writes and built-in memory mirrors go there instead of `memory_dir`, and nothing under the wiki root is written. Staged pages are not indexed or recalled until you promote them into the wiki. A path inside the wiki (or a symlink into it) makes the provider inactive with an error. `~` and `$HERMES_HOME` expand. |
+| `staging_path` | | Absolute folder **outside** the wiki. When set, agent writes and built-in memory mirrors go there instead of `memory_dir`, and nothing under the wiki root is written. Staged pages are not indexed or recalled until you promote them into the wiki. A path inside the wiki (or a symlink into it), a blank value, or an `index_path` inside the wiki makes the provider inactive with an error. `~` and `$HERMES_HOME` expand. Included in `hermes backup` when outside `HERMES_HOME`. |
 | `untrusted_dirs` | `["raw"]` | Never indexed, recalled or readable through memory tools. |
 | `include` | `["**/*.md"]` | Root-relative globs to index. |
 | `exclude` | `[]` | Root-relative globs to skip (`.git`, `node_modules`, `.obsidian` and similar are always skipped). |

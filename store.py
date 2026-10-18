@@ -280,17 +280,37 @@ class WikiStore:
         self.untrusted_dirs = tuple(d.strip("/") for d in untrusted_dirs if d.strip("/"))
         self.memory_dir = memory_dir.strip("/")
         self.staging_root: Optional[Path] = None
-        if staging_path and str(staging_path).strip():
+        self._staging_configured: Optional[Path] = None
+        if staging_path is not None and str(staging_path) != "":
+            if not str(staging_path).strip():
+                raise ValueError("staging_path is blank; leave it unset or give an absolute path")
             staging = Path(staging_path).expanduser()
             if not staging.is_absolute():
                 raise ValueError(f"staging_path must be an absolute path: {staging_path}")
-            staging = staging.resolve()
-            if staging == self.root or self.root in staging.parents:
-                raise ValueError(
-                    f"staging_path must be outside the wiki root ({self.root}); "
-                    "use memory_dir for writes inside the wiki"
-                )
-            self.staging_root = staging
+            self._staging_configured = staging
+            self.staging_root = self._resolve_staging()
+
+    def _resolve_staging(self) -> Path:
+        """Resolve the configured staging folder now and check it is outside the wiki."""
+        assert self._staging_configured is not None
+        staging = self._staging_configured.resolve()
+        if staging == self.root or self.root in staging.parents:
+            raise ValueError(
+                f"staging_path must be outside the wiki root ({self.root}); "
+                "use memory_dir for writes inside the wiki"
+            )
+        return staging
+
+    def assert_outside_wiki(self, path: os.PathLike | str, what: str) -> None:
+        """With staging on, nothing hwiki writes may live under the wiki root."""
+        if self.staging_root is None or not str(path):
+            return
+        resolved = Path(path).expanduser().resolve()
+        if resolved == self.root or self.root in resolved.parents:
+            raise ValueError(
+                f"{what} ({resolved}) is inside the wiki root, but staging_path is set "
+                "so the wiki must never be written; move it outside the wiki"
+            )
 
     # -- discovery ---------------------------------------------------------
 
@@ -502,8 +522,14 @@ class WikiStore:
                 )
 
         slug = slugify(page or topic or "journal", fallback="journal")
+        if self._staging_configured is not None and self._resolve_staging() != self.staging_root:
+            # The folder was replaced (e.g. by a symlink) after start-up.
+            raise ValueError("staging_path no longer resolves to the folder checked at start-up; "
+                             "refusing to write")
         target = self.memory_page_path(slug)
         target.parent.mkdir(parents=True, exist_ok=True)
+        if target.is_symlink() or target.with_suffix(target.suffix + ".lock").is_symlink():
+            raise ValueError(f"refusing to write through a symlink: {target.name}")
 
         stamp = today or date.today().isoformat()
         suffix = ""
@@ -530,10 +556,10 @@ class WikiStore:
                     "> conclusions into the curated wiki rather than editing in place.\n\n"
                     "## Log\n\n"
                 )
-                target.write_text(header + entry + "\n", encoding="utf-8")
+                _write_nofollow(target, header + entry + "\n")
                 return {"path": self._written_path(target), "created": True, "duplicate": False}
 
-            existing = target.read_text(encoding="utf-8", errors="replace")
+            existing = _read_nofollow(target)
             if _normalize(content) in _normalize(existing):
                 return {"path": self._written_path(target), "created": False, "duplicate": True}
 
@@ -541,7 +567,7 @@ class WikiStore:
                 existing = existing.rstrip("\n") + "\n\n## Log\n"
             updated = existing.rstrip("\n") + "\n" + entry + "\n"
             updated = _bump_frontmatter_date(updated, stamp)
-            target.write_text(updated, encoding="utf-8")
+            _write_nofollow(target, updated)
 
         return {"path": self._written_path(target), "created": False, "duplicate": False}
 
@@ -556,6 +582,23 @@ class WikiStore:
             digest.update(str(abspath).encode())
             digest.update(f"{stat.st_mtime_ns}:{stat.st_size}".encode())
         return digest.hexdigest()
+
+
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def _read_nofollow(path: Path) -> str:
+    """Read a memory page, refusing a symlink swapped in after the check."""
+    fd = os.open(path, os.O_RDONLY | _O_NOFOLLOW)
+    with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as handle:
+        return handle.read()
+
+
+def _write_nofollow(path: Path, text: str) -> None:
+    """Write a memory page, refusing a symlink swapped in after the check."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
 
 
 def _normalize(text: str) -> str:
@@ -585,7 +628,8 @@ class _FileLock:
 
     def __enter__(self) -> "_FileLock":
         self.lockfile.parent.mkdir(parents=True, exist_ok=True)
-        self._handle = open(self.lockfile, "a+")
+        fd = os.open(self.lockfile, os.O_RDWR | os.O_CREAT | os.O_APPEND | _O_NOFOLLOW, 0o644)
+        self._handle = os.fdopen(fd, "a+")
         if fcntl is None:
             return self
         deadline = time.time() + self.timeout

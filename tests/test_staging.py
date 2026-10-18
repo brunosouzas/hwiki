@@ -61,8 +61,8 @@ def call(provider, tool, **args):
 
 def test_write_goes_to_staging_and_wiki_is_untouched(tmp_path, wiki):
     staging = tmp_path / "staging"
+    before = snapshot(wiki)  # before initialize(): start-up must not write the wiki either
     provider = make_provider(tmp_path, wiki, staging_path=str(staging))
-    before = snapshot(wiki)
 
     res = call(provider, "wiki_memory_write", content=f"The {TOKEN} release ships on Fridays.",
                page="decisions")
@@ -89,17 +89,103 @@ def test_duplicate_staged_fact_is_not_appended_twice(tmp_path, wiki):
 def test_secret_is_refused_in_staging_too(tmp_path, wiki):
     staging = tmp_path / "staging"
     provider = make_provider(tmp_path, wiki, staging_path=str(staging))
+    assert call(provider, "wiki_memory_write", content=f"The {TOKEN} release ships on Fridays.")["staged"]
+    before = snapshot(staging)
     res = call(provider, "wiki_memory_write",
                content="deploy key ghp_" + "a" * 36 + " for the bot")
     assert res.get("success") is not True
-    assert not staging.exists() or not any(staging.glob("*.md"))
+    assert snapshot(staging) == before
     provider.shutdown()
+
+
+def test_staged_page_symlinked_into_the_wiki_is_not_written(tmp_path, wiki):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / "journal.md").symlink_to(wiki / "wiki" / "concepts" / "release.md")
+    before = snapshot(wiki)
+    provider = make_provider(tmp_path, wiki, staging_path=str(staging))
+
+    res = call(provider, "wiki_memory_write", content=f"The {TOKEN} release ships on Fridays.")
+
+    assert res.get("success") is not True
+    assert "symlink" in res["error"]
+    assert snapshot(wiki) == before
+    provider.shutdown()
+
+
+def test_staged_lockfile_symlinked_into_the_wiki_is_not_written(tmp_path, wiki):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / "journal.md.lock").symlink_to(wiki / "wiki" / "concepts" / "release.md")
+    before = snapshot(wiki)
+    provider = make_provider(tmp_path, wiki, staging_path=str(staging))
+    res = call(provider, "wiki_memory_write", content=f"The {TOKEN} release ships on Fridays.")
+    assert res.get("success") is not True
+    assert snapshot(wiki) == before
+    provider.shutdown()
+
+
+def test_staging_folder_replaced_by_a_symlink_after_start_is_refused(tmp_path, wiki):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    before = snapshot(wiki)
+    provider = make_provider(tmp_path, wiki, staging_path=str(staging))
+    staging.rmdir()
+    staging.symlink_to(wiki / "wiki", target_is_directory=True)
+
+    res = call(provider, "wiki_memory_write", content=f"The {TOKEN} release ships on Fridays.")
+    provider.on_memory_write("add", "memory", f"User prefers the {TOKEN} theme.")
+
+    assert res.get("success") is not True
+    assert snapshot(wiki) == before
+    provider.shutdown()
+
+
+def test_index_inside_the_wiki_is_refused_when_staging(tmp_path, wiki):
+    before = snapshot(wiki)
+    provider = make_provider(tmp_path, wiki, staging_path=str(tmp_path / "staging"),
+                             index_path=str(wiki / "hwiki-index.sqlite"))
+    assert "index_path" in provider.system_prompt_block()
+    assert snapshot(wiki) == before
+    provider.shutdown()
+
+    config = dict(cfg.DEFAULTS, wiki_path=str(wiki), staging_path=str(tmp_path / "staging"),
+                  index_path=str(wiki / "i.sqlite"), _hermes_home=str(tmp_path))
+    with pytest.raises(ValueError, match="index_path"):
+        cfg.build_runtime(config)
+    assert snapshot(wiki) == before
+
+
+def test_blank_staging_path_is_refused(tmp_path, wiki):
+    before = snapshot(wiki)
+    provider = make_provider(tmp_path, wiki, staging_path="   ")
+    assert "blank" in provider.system_prompt_block()
+    res = call(provider, "wiki_memory_write", content=f"The {TOKEN} release ships on Fridays.")
+    assert res.get("success") is not True
+    assert snapshot(wiki) == before
+    provider.shutdown()
+
+
+def test_backup_paths_include_staging_outside_hermes_home(tmp_path, wiki):
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "staging"
+    outside.mkdir()
+    inside = home / "hwiki-staging"
+    inside.mkdir()
+    base = dict(cfg.DEFAULTS, wiki_path=str(wiki), _hermes_home=str(home))
+
+    provider = WikiMemoryProvider(config=dict(base, staging_path=str(outside)))
+    assert provider.backup_paths() == [str(wiki), str(outside)]  # before initialize()
+
+    provider = WikiMemoryProvider(config=dict(base, staging_path="$HERMES_HOME/hwiki-staging"))
+    assert provider.backup_paths() == [str(wiki)]  # HERMES_HOME is backed up anyway
 
 
 def test_builtin_memory_mirror_goes_to_staging(tmp_path, wiki):
     staging = tmp_path / "staging"
+    before = snapshot(wiki)  # before initialize(): start-up must not write the wiki either
     provider = make_provider(tmp_path, wiki, staging_path=str(staging))
-    before = snapshot(wiki)
 
     provider.on_memory_write("add", "memory", f"User prefers the {TOKEN} theme.")
 

@@ -271,6 +271,13 @@ class WikiMemoryProvider(MemoryProvider):
 
         index_path = (_expand(str(self._config.get("index_path") or ""), self._hermes_home)
                       or default_index_path(self._hermes_home))
+        try:
+            self._store.assert_outside_wiki(index_path, "index_path")
+        except ValueError as exc:
+            self._init_error = str(exc)
+            logger.warning("wiki memory: %s", self._init_error)
+            self._store = None
+            return
 
         self._backend = build_backend(
             self._store,
@@ -337,7 +344,15 @@ class WikiMemoryProvider(MemoryProvider):
     def backup_paths(self) -> List[str]:
         """The wiki usually lives outside HERMES_HOME — declare it for backups."""
         raw = _expand(str(self._config.get("wiki_path") or ""), self._hermes_home)
-        return [raw] if raw and Path(raw).is_dir() else []
+        paths = [raw] if raw and Path(raw).is_dir() else []
+        # Staged facts live only in staging_path until promoted, so back them up too.
+        staging = _expand(str(self._config.get("staging_path") or "").strip(), self._hermes_home)
+        if staging and Path(staging).is_absolute() and Path(staging).is_dir():
+            home = Path(self._hermes_home or resolve_hermes_home()).expanduser().resolve()
+            resolved = Path(staging).resolve()
+            if resolved != home and home not in resolved.parents:  # HERMES_HOME is backed up anyway
+                paths.append(staging)
+        return paths
 
     # -- indexing ----------------------------------------------------------
 
