@@ -22,6 +22,7 @@ import fnmatch
 import hashlib
 import os
 import re
+import stat
 import time
 import unicodedata
 from dataclasses import dataclass, field
@@ -281,6 +282,7 @@ class WikiStore:
         self.memory_dir = memory_dir.strip("/")
         self.staging_root: Optional[Path] = None
         self._staging_configured: Optional[Path] = None
+        self._staging_identity: Optional[Tuple[int, int]] = None
         if staging_path is not None and str(staging_path) != "":
             if not str(staging_path).strip():
                 raise ValueError("staging_path is blank; leave it unset or give an absolute path")
@@ -289,6 +291,10 @@ class WikiStore:
                 raise ValueError(f"staging_path must be an absolute path: {staging_path}")
             self._staging_configured = staging
             self.staging_root = self._resolve_staging()
+            self.staging_root.mkdir(parents=True, exist_ok=True)
+            info = os.stat(self.staging_root)
+            # Every write checks it still opens this very folder (see _MemoryDir).
+            self._staging_identity = (info.st_dev, info.st_ino)
 
     def _resolve_staging(self) -> Path:
         """Resolve the configured staging folder now and check it is outside the wiki."""
@@ -522,14 +528,8 @@ class WikiStore:
                 )
 
         slug = slugify(page or topic or "journal", fallback="journal")
-        if self._staging_configured is not None and self._resolve_staging() != self.staging_root:
-            # The folder was replaced (e.g. by a symlink) after start-up.
-            raise ValueError("staging_path no longer resolves to the folder checked at start-up; "
-                             "refusing to write")
         target = self.memory_page_path(slug)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.is_symlink() or target.with_suffix(target.suffix + ".lock").is_symlink():
-            raise ValueError(f"refusing to write through a symlink: {target.name}")
+        name, lock_name = target.name, target.name + ".lock"
 
         stamp = today or date.today().isoformat()
         suffix = ""
@@ -539,37 +539,50 @@ class WikiStore:
             suffix += f" _(source: {source})_"
         entry = f"- **{stamp}** — {content}{suffix}"
 
-        with _FileLock(target):
-            created = not target.exists()
-            if created:
-                header = (
-                    "---\n"
-                    f"title: {topic or slug.replace('-', ' ').title()}\n"
-                    "spine: memory\n"
-                    "type: memory\n"
-                    "status: auto\n"
-                    "source: agent-memory\n"
-                    f"updated: {stamp}\n"
-                    "---\n\n"
-                    f"# {topic or slug.replace('-', ' ').title()}\n\n"
-                    "> Auto-maintained by the `hwiki` memory provider. Promote durable\n"
-                    "> conclusions into the curated wiki rather than editing in place.\n\n"
-                    "## Log\n\n"
-                )
-                _write_nofollow(target, header + entry + "\n")
-                return {"path": self._written_path(target), "created": True, "duplicate": False}
+        with self._open_memory_dir() as folder:
+            folder.refuse_symlink(name)
+            folder.refuse_symlink(lock_name)
+            with folder.lock(lock_name):
+                if not folder.exists(name):
+                    header = (
+                        "---\n"
+                        f"title: {topic or slug.replace('-', ' ').title()}\n"
+                        "spine: memory\n"
+                        "type: memory\n"
+                        "status: auto\n"
+                        "source: agent-memory\n"
+                        f"updated: {stamp}\n"
+                        "---\n\n"
+                        f"# {topic or slug.replace('-', ' ').title()}\n\n"
+                        "> Auto-maintained by the `hwiki` memory provider. Promote durable\n"
+                        "> conclusions into the curated wiki rather than editing in place.\n\n"
+                        "## Log\n\n"
+                    )
+                    folder.write(name, header + entry + "\n")
+                    return {"path": self._written_path(target), "created": True, "duplicate": False}
 
-            existing = _read_nofollow(target)
-            if _normalize(content) in _normalize(existing):
-                return {"path": self._written_path(target), "created": False, "duplicate": True}
+                existing = folder.read(name)
+                if _normalize(content) in _normalize(existing):
+                    return {"path": self._written_path(target), "created": False, "duplicate": True}
 
-            if "\n## Log" not in existing:
-                existing = existing.rstrip("\n") + "\n\n## Log\n"
-            updated = existing.rstrip("\n") + "\n" + entry + "\n"
-            updated = _bump_frontmatter_date(updated, stamp)
-            _write_nofollow(target, updated)
+                if "\n## Log" not in existing:
+                    existing = existing.rstrip("\n") + "\n\n## Log\n"
+                updated = existing.rstrip("\n") + "\n" + entry + "\n"
+                updated = _bump_frontmatter_date(updated, stamp)
+                folder.write(name, updated)
 
         return {"path": self._written_path(target), "created": False, "duplicate": False}
+
+    def _open_memory_dir(self) -> "_MemoryDir":
+        """Open the folder writes go to; with staging, refuse if it is no longer the one checked."""
+        if self.staging_root is None:
+            root = self.memory_root()
+            root.mkdir(parents=True, exist_ok=True)
+            return _MemoryDir(root)
+        if self._resolve_staging() != self.staging_root:
+            raise ValueError("staging_path no longer resolves to the folder checked at start-up; "
+                             "refusing to write")
+        return _MemoryDir(self.staging_root, expected=self._staging_identity)
 
     def content_hash(self) -> str:
         """Cheap fingerprint of the corpus (paths + mtimes + sizes)."""
@@ -585,20 +598,78 @@ class WikiStore:
 
 
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+_DIR_FD = all(f in os.supports_dir_fd for f in (os.open, os.stat, os.unlink))
 
 
-def _read_nofollow(path: Path) -> str:
-    """Read a memory page, refusing a symlink swapped in after the check."""
-    fd = os.open(path, os.O_RDONLY | _O_NOFOLLOW)
-    with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as handle:
-        return handle.read()
+class _MemoryDir:
+    """The folder memory pages are written to, opened once per write.
 
+    Where the OS allows it, every file operation is relative to a descriptor
+    of the folder itself and refuses symlinks (``O_NOFOLLOW``), so swapping a
+    page, its lock file or the folder for a symlink after the checks cannot
+    redirect the write. With ``expected`` (the staging folder's device and
+    inode recorded at start-up), opening a different folder is refused.
+    """
 
-def _write_nofollow(path: Path, text: str) -> None:
-    """Write a memory page, refusing a symlink swapped in after the check."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_NOFOLLOW, 0o644)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(text)
+    def __init__(self, root: Path, expected: Optional[Tuple[int, int]] = None) -> None:
+        self.root = root
+        self.fd: Optional[int] = None
+        if _DIR_FD:
+            self.fd = os.open(root, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW)
+            info = os.fstat(self.fd)
+        else:  # pragma: no cover - platforms without dir_fd (Windows)
+            info = os.lstat(root)
+            if stat.S_ISLNK(info.st_mode):
+                raise ValueError("refusing to write through a symlinked memory folder")
+        if expected is not None and (info.st_dev, info.st_ino) != expected:
+            self.close()
+            raise ValueError("the staging folder changed since start-up; refusing to write")
+
+    def __enter__(self) -> "_MemoryDir":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def _path(self, name: str) -> str:
+        return name if self.fd is not None else str(self.root / name)
+
+    def _kw(self) -> Dict[str, int]:
+        return {"dir_fd": self.fd} if self.fd is not None else {}
+
+    def _lstat(self, name: str):
+        try:
+            return os.stat(self._path(name), follow_symlinks=False, **self._kw())
+        except FileNotFoundError:
+            return None
+
+    def refuse_symlink(self, name: str) -> None:
+        info = self._lstat(name)
+        if info is not None and stat.S_ISLNK(info.st_mode):
+            raise ValueError(f"refusing to write through a symlink: {name}")
+
+    def exists(self, name: str) -> bool:
+        return self._lstat(name) is not None
+
+    def read(self, name: str) -> str:
+        fd = os.open(self._path(name), os.O_RDONLY | _O_NOFOLLOW, **self._kw())
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+
+    def write(self, name: str, text: str) -> None:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_NOFOLLOW
+        fd = os.open(self._path(name), flags, 0o644, **self._kw())
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def lock(self, name: str, timeout: float = 5.0) -> "_FileLock":
+        return _FileLock(self, name, timeout)
 
 
 def _normalize(text: str) -> str:
@@ -621,14 +692,15 @@ def _bump_frontmatter_date(text: str, stamp: str) -> str:
 class _FileLock:
     """Best-effort advisory lock so concurrent turns can't interleave writes."""
 
-    def __init__(self, target: Path, timeout: float = 5.0) -> None:
-        self.lockfile = target.with_suffix(target.suffix + ".lock")
+    def __init__(self, folder: _MemoryDir, name: str, timeout: float = 5.0) -> None:
+        self.folder = folder
+        self.name = name
         self.timeout = timeout
         self._handle = None
 
     def __enter__(self) -> "_FileLock":
-        self.lockfile.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self.lockfile, os.O_RDWR | os.O_CREAT | os.O_APPEND | _O_NOFOLLOW, 0o644)
+        flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | _O_NOFOLLOW
+        fd = os.open(self.folder._path(self.name), flags, 0o644, **self.folder._kw())
         self._handle = os.fdopen(fd, "a+")
         if fcntl is None:
             return self
@@ -655,6 +727,6 @@ class _FileLock:
         except Exception:
             pass
         try:
-            self.lockfile.unlink()
+            os.unlink(self.folder._path(self.name), **self.folder._kw())
         except OSError:
             pass

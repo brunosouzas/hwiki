@@ -141,6 +141,32 @@ def test_staging_folder_replaced_by_a_symlink_after_start_is_refused(tmp_path, w
     provider.shutdown()
 
 
+def test_staging_parent_swapped_between_check_and_open_is_refused(tmp_path, wiki, monkeypatch):
+    """The folder is swapped after validation but before the write opens it."""
+    parent = tmp_path / "parent"
+    staging = parent / "staging"
+    staging.mkdir(parents=True)
+    decoy = wiki / "wiki" / "decoy"
+    (decoy / "staging").mkdir(parents=True)
+    before = snapshot(wiki)
+    provider = make_provider(tmp_path, wiki, staging_path=str(staging))
+    store = provider._store
+    checked = store.staging_root
+
+    def validate_then_swap():
+        parent.rename(tmp_path / "parent-old")
+        parent.symlink_to(decoy, target_is_directory=True)
+        return checked  # the check already passed with the real folder
+
+    monkeypatch.setattr(store, "_resolve_staging", validate_then_swap)
+    res = call(provider, "wiki_memory_write", content=f"The {TOKEN} release ships on Fridays.")
+
+    assert (tmp_path / "parent").is_symlink(), "the swap did not happen"
+    assert res.get("success") is not True
+    assert snapshot(wiki) == before
+    provider.shutdown()
+
+
 def test_index_inside_the_wiki_is_refused_when_staging(tmp_path, wiki):
     before = snapshot(wiki)
     provider = make_provider(tmp_path, wiki, staging_path=str(tmp_path / "staging"),
