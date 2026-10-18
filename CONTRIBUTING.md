@@ -35,6 +35,11 @@ in `tests/test_store_search.py`.
 a throwaway config and cache directory. It runs when `qmd` is on `PATH`, or when
 `HWIKI_QMD_BINARY` points at it, and is skipped otherwise.
 
+Set `HWIKI_HERMES_SRC=/path/to/hermes-agent` (a Hermes source checkout, for
+example `~/.hermes/hermes-agent`) to run the tests in
+`tests/test_context_threads.py` against Hermes' own `spawn_context_thread` and
+profile home; without it they are skipped.
+
 ## Pull requests
 
 Add a test for every behaviour change, ideally one that fails before your change.
