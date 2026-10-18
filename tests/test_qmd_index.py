@@ -177,8 +177,15 @@ TRICKY = {
     "rawa/z.md": "notbraceexpanded",                 # NOT excluded: braces are literal
     "deep/x/99 - Local Private/p.md": "nestedprivate",  # exclude *99 - Local Private/*
     "keep/notes.md": "keepnotes",                    # not excluded
+    "cls/a.md": "classliteralcaret",                 # exclude cls/[^a].md: ^ is literal in fnmatch
+    "cls/b.md": "classb",                            # NOT excluded
+    "neg/zy.md": "negatedclass",                     # exclude neg/[!x]y.md
+    "neg/xy.md": "negatedkeep",                      # NOT excluded
+    "negy.md/a.md": "unrelated",                     # NOT excluded
+    "neg/y.md": "negatedslash",                      # exclude neg[!x]y.md: [!x] matches /
 }
-TRICKY_EXCLUDE = ["private*.md", "notes/a?b.md", "*99 - Local Private/*"]
+TRICKY_EXCLUDE = ["private*.md", "notes/a?b.md", "*99 - Local Private/*", "cls/[^a].md",
+                  "neg/[!x]y.md", "neg[!x]y.md"]
 TRICKY_UNTRUSTED = ["raw(foo)", "raw{a,b}"]
 
 
@@ -199,6 +206,8 @@ def test_qmd_never_indexes_what_hwiki_excludes(qmd_env, tmp_path):
             assert token.encode() not in data, f"{rel} is excluded by hwiki but qmd indexed it"
     # sanity: the fixture really exercises exclusions both ways
     assert "rawa/z.md" in hwiki_paths and "private/team-secret.md" not in hwiki_paths
+    assert "cls/b.md" in hwiki_paths and "cls/a.md" not in hwiki_paths
+    assert "neg/xy.md" in hwiki_paths and "neg/y.md" not in hwiki_paths
 
 
 def test_inherited_index_path_does_not_redirect_qmd(qmd_env, wiki, tmp_path, monkeypatch):
@@ -242,6 +251,50 @@ def test_failed_cleanup_is_retried_until_it_succeeds(qmd_env, wiki, tmp_path):
     assert PRIVATE.encode() not in index_bytes(qmd_env["cache"])
 
 
+def crashing_update_wrapper(tmp_path: Path, real: str, flag: Path) -> str:
+    """A qmd whose `update` does its work and then fails while ``flag`` exists (a crash after commit)."""
+    wrapper = tmp_path / "qmd-crash"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        f'{json.dumps(real)} "$@"; rc=$?\n'
+        f'for a in "$@"; do if [ "$a" = update ] && [ -e {json.dumps(str(flag))} ]; then exit 1; fi; done\n'
+        "exit $rc\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    return str(wrapper)
+
+
+def test_update_interrupted_after_removals_still_gets_its_cleanup(qmd_env, wiki, tmp_path):
+    backend(WikiStore(wiki, untrusted_dirs=[], exclude=[]), qmd_env["binary"]).sync()
+    assert PRIVATE.encode() in index_bytes(qmd_env["cache"])
+
+    flag = tmp_path / "crash-update"
+    flag.touch()
+    wrapper = crashing_update_wrapper(tmp_path, qmd_env["binary"], flag)
+    after = WikiStore(wiki, untrusted_dirs=["raw"], exclude=["private/*"])
+    backend(after, wrapper).sync()  # update deactivates the files, then "crashes"
+
+    flag.unlink()
+    backend(after, qmd_env["binary"]).sync()  # new process: config unchanged, 0 removed now
+    assert PRIVATE.encode() not in index_bytes(qmd_env["cache"])
+    assert not (qmd_env["config"] / f"{INDEX}.hwiki-cleanup-pending").exists()
+
+
+def test_qmd_default_index_name_is_refused(qmd_env, wiki):
+    qmd_env["config"].mkdir(parents=True)
+    default = qmd_env["config"] / "index.yml"
+    original = "collections:\n  notes:\n    path: /somewhere/else\n    pattern: \"**/*.md\"\n"
+    default.write_text(original, encoding="utf-8")
+    store = WikiStore(wiki, untrusted_dirs=["raw"], exclude=["private/*"])
+    for name in ("index", "INDEX"):
+        qmd = QmdBackend(store, collection="wiki", binary=qmd_env["binary"], index=name)
+        assert qmd.is_available() is False
+        assert qmd.sync() == {}
+    assert default.read_text(encoding="utf-8") == original
+    assert not (qmd_env["cache"] / "qmd" / "index.sqlite").exists()
+
+
 def test_without_pyyaml_an_existing_config_is_not_overwritten(qmd_env, wiki, monkeypatch):
     monkeypatch.setitem(sys.modules, "yaml", None)  # import yaml -> ImportError
     qmd_env["config"].mkdir(parents=True)
@@ -280,6 +333,8 @@ def test_invalid_index_names_disable_qmd_without_touching_files(tmp_path, monkey
     ("a?b", ["a?b", "a/b"]),
     ("raw(x)/*", ["raw\\(x\\)/*", "raw\\(x\\)/*/**/*"]),
     ("x[0-9].md", ["x[0-9].md"]),
+    ("x[^a].md", ["x[\\^a].md"]),
+    ("x[!a].md", ["x[^a].md", "x/.md"]),
 ])
 def test_exclude_glob_variants(pattern, expected):
     assert _globs_for_qmd(pattern) == expected
@@ -287,6 +342,7 @@ def test_exclude_glob_variants(pattern, expected):
 
 def test_many_wildcards_fall_back_to_the_directory():
     assert _globs_for_qmd("docs/a*b*c*d*e*f*g*h.md") == ["docs/**"]
+    assert _globs_for_qmd("docs/[ab]/a*b*c*d*e*f*g*h.md") == ["docs/**"]
     assert _globs_for_qmd("*a*b*c*d*e*f*") == ["**"]
 
 

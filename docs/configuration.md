@@ -26,7 +26,7 @@ Configuration lives in `$HERMES_HOME/hwiki.json` (`$HERMES_HOME` is `~/.hermes`,
 | `mirror_page` | `builtin-mirror` | Memory page receiving those mirrors. |
 | `qmd_binary` | `qmd` | Path or name of the qmd executable. |
 | `qmd_collection` | `hwiki` | qmd collection name. |
-| `qmd_index` | `hwiki` | Dedicated qmd index (`qmd --index <name>`): config in `~/.config/qmd/<name>.yml`, data in `~/.cache/qmd/<name>.sqlite`. Letters, digits, `-` and `_` only (anything else disables qmd). hwiki owns its `collections:` section; give each profile its own name if they point at different wikis. |
+| `qmd_index` | `hwiki` | Dedicated qmd index (`qmd --index <name>`): config in `~/.config/qmd/<name>.yml`, data in `~/.cache/qmd/<name>.sqlite`. Letters, digits, `-` and `_` only, and never qmd's default `index` (anything else disables qmd). hwiki owns its `collections:` section; give each profile its own name if they point at different wikis. |
 | `qmd_mode` | `search` | `search` (BM25), `vsearch` (vector), `query` (hybrid + rerank). |
 | `qmd_timeout_s` | `6.0` | Per-query qmd budget before falling back to FTS5. |
 

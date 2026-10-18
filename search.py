@@ -288,10 +288,28 @@ def qmd_config_dir() -> Path:
 _GLOB_SPECIAL = frozenset("\\*?[]{}()!@+")
 _MAX_GLOB_WILDCARDS = 6
 _INDEX_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+_RESERVED_INDEX_NAMES = frozenset({"index"})  # qmd's default index: never take it over
 
 
 def _escape_glob(text: str) -> str:
     return "".join("\\" + ch if ch in _GLOB_SPECIAL else ch for ch in text)
+
+
+def _class_token(text: str) -> tuple:
+    """Translate an ``fnmatch`` ``[...]`` class into fast-glob syntax.
+
+    fnmatch negates with ``!`` and treats ``^`` as a literal; fast-glob
+    negates with ``^`` and reads ``[!a]`` as the set ``{!, a}``. A negated
+    class, or one listing ``/``, can match ``/`` in fnmatch, so it is a
+    wildcard that also needs a crossing form.
+    """
+    body = text[1:-1]
+    negate = body.startswith("!")
+    if negate:
+        body = body[1:]
+    escaped = "".join("\\" + ch if ch in "\\^[]" else ch for ch in body)
+    can_cross = negate or "/" in body
+    return ("class", "[" + ("^" if negate else "") + escaped + "]", can_cross)
 
 
 def _fnmatch_tokens(pattern: str) -> List[tuple]:
@@ -317,7 +335,7 @@ def _fnmatch_tokens(pattern: str) -> List[tuple]:
                 j += 1
             close = pattern.find("]", j)
             if close != -1:
-                tokens.append(("class", pattern[i:close + 1]))
+                tokens.append(_class_token(pattern[i:close + 1]))
                 i = close + 1
                 continue
         tokens.append(("lit", ch))
@@ -334,26 +352,28 @@ def _globs_for_qmd(pattern: str) -> List[str]:
     (``*/**/*``, ``/``), and every combination is emitted, so ``private*.md``
     also ignores ``private/team-secret.md``. Literal text is escaped.
     Patterns with more than six wildcards fall back to ignoring the whole
-    directory before the first wildcard (broader than hwiki: it only costs
-    qmd recall). ``[...]`` classes are copied as they are.
+    directory before the first wildcard or class (broader than hwiki: it only
+    costs qmd recall). ``[...]`` classes are translated (see ``_class_token``).
     """
     tokens = _fnmatch_tokens(pattern.strip().lstrip("/"))
     if not tokens:
         return []
-    wildcards = [i for i, (kind, _) in enumerate(tokens) if kind in {"star", "any"}]
+    wildcards = [i for i, token in enumerate(tokens)
+                 if token[0] in {"star", "any"} or (token[0] == "class" and token[2])]
     if len(wildcards) > _MAX_GLOB_WILDCARDS:
-        prefix = "".join(text for kind, text in tokens[:wildcards[0]])
+        first = next(i for i, token in enumerate(tokens) if token[0] != "lit")
+        prefix = "".join(token[1] for token in tokens[:first])
         directory = prefix.rsplit("/", 1)[0] if "/" in prefix else ""
         return [f"{_escape_glob(directory)}/**" if directory else "**"]
     out: List[str] = []
     for mask in range(1 << len(wildcards)):
         crossing = {wildcards[bit] for bit in range(len(wildcards)) if mask >> bit & 1}
         parts = []
-        for i, (kind, text) in enumerate(tokens):
+        for i, (kind, text, *_rest) in enumerate(tokens):
             if kind == "lit":
                 parts.append(_escape_glob(text))
             elif kind == "class":
-                parts.append(text)
+                parts.append("/" if i in crossing else text)
             elif kind == "star":
                 parts.append("*/**/*" if i in crossing else "*")
             else:
@@ -406,11 +426,12 @@ class QmdBackend:
         self.store = store
         self.collection = collection
         self.index = index or "hwiki"
-        self.index_valid = bool(_INDEX_NAME_RE.match(self.index))
+        self.index_valid = bool(_INDEX_NAME_RE.match(self.index)) and \
+            self.index.lower() not in _RESERVED_INDEX_NAMES
         if not self.index_valid:
             logger.warning(
-                "wiki memory: qmd_index %r must be letters, digits, '-' or '_'; qmd disabled",
-                self.index,
+                "wiki memory: qmd_index %r must be letters, digits, '-' or '_' and not "
+                "qmd's default 'index'; qmd disabled", self.index,
             )
         self.binary = binary
         self.mode = mode if mode in {"search", "vsearch", "query"} else "search"
@@ -526,16 +547,21 @@ class QmdBackend:
             return {}
         marker = self._cleanup_marker()
         try:
+            # The marker is written BEFORE update: qmd commits removals as it goes,
+            # so an update that times out or crashes may already have deactivated
+            # files, and only a cleanup drops their content and vectors.
+            owed = marker.exists() or self._config_changed
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.touch()
             proc = self._run(["update"], timeout=300)
             if proc.returncode != 0:
                 logger.debug("qmd update exited %s", proc.returncode)
                 return {}
             match = re.search(r"(\d+)\s+removed", proc.stdout or "")
             removed = int(match.group(1)) if match else 0
-            if removed or self._config_changed:
-                marker.parent.mkdir(parents=True, exist_ok=True)
-                marker.touch()
-                self._config_changed = False
+            self._config_changed = False
+            if not (owed or removed):
+                marker.unlink()
             if marker.exists():
                 cleanup = self._run(["cleanup"], timeout=300)
                 if cleanup.returncode == 0:
